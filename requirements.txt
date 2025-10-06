@@ -1,0 +1,11 @@
+# Core dependencies for Audiobookshelf Downloader
+cryptography>=41.0.0
+keyring>=25.0.0
+aiohttp>=3.8.0
+aiofiles>=23.0.0
+
+# Optional dependencies for better functionality
+jaraco.classes>=3.4.0
+jaraco.functools>=4.3.0
+jaraco.context>=6.0.0
+more-itertools>=10.8.0
