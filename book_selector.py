@@ -67,7 +67,7 @@ class BookSelector:
         # Check for audio files in basic data
         # Most audiobooks will have duration if they have audio
         duration = media.get('duration', book.get('duration', 0))
-        if duration > 0:
+        if duration and duration > 0:
             audio_available = "✓"
 
         # Check for ebook indicators in basic data

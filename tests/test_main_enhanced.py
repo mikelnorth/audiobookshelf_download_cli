@@ -2,7 +2,8 @@
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add parent directory to path so we can import from root
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from book_selector import BookSelector
 from audiobookshelf_downloader import AudiobookshelfDownloader
@@ -10,18 +11,18 @@ from audiobookshelf_downloader import AudiobookshelfDownloader
 def test_main_enhanced():
     """Test the enhanced main display with Audio and Ebook columns."""
     print("Testing enhanced main display with Audio and Ebook columns...")
-    
+
     # Create a mock downloader
     class MockDownloader:
         def __init__(self, download_path):
             self.download_path = download_path
-        
+
         async def download_book(self, book, library_id):
             return True
-    
+
     downloader = MockDownloader("/tmp/test")
     selector = BookSelector(downloader, "test-library-id")
-    
+
     # Test with mock books showing both audio and ebook formats
     mock_books = [
         {
@@ -58,10 +59,10 @@ def test_main_enhanced():
             }
         }
     ]
-    
+
     # Test the enhanced display
     selector.display_books(mock_books)
-    
+
     print("\n🎉 Enhanced main display is working!")
     print("The main book selector now shows:")
     print("- Audio column: ✅ if audio available, ❌ if not")

@@ -43,7 +43,7 @@ def test_connection():
     """Test connection."""
     print("\n🧪 Test Connection")
     print("-" * 20)
-    result = os.system("python test_connection.py")
+    result = os.system("python tests/test_connection.py")
     # If the user exited normally (choice 3), don't show the continue prompt
     return result == 0
 
