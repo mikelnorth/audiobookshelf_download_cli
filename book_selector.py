@@ -583,6 +583,7 @@ Commands:
         # Try to get target server from API key manager
         target_url = None
         target_key = None
+        target_download_path = None
 
         try:
             from api_key_manager import APIKeyManager
@@ -607,7 +608,7 @@ Commands:
                     if 0 <= choice < len(keys):
                         # Use selected API key
                         selected_key = keys[choice]
-                        target_url, target_key, _ = manager.get_key(selected_key['name'])
+                        target_url, target_key, target_download_path = manager.get_key(selected_key['name'])
                         print(f"🔑 Using server: {selected_key['name']}")
                     elif choice == len(keys):
                         # Manual entry
@@ -645,7 +646,7 @@ Commands:
 
         try:
             # Create target server connection
-            target_downloader = AudiobookshelfDownloader(target_url, target_key)
+            target_downloader = AudiobookshelfDownloader(target_url, target_key, target_download_path)
 
             async with target_downloader:
                 # Test connection

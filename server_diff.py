@@ -1174,7 +1174,7 @@ async def select_library_for_server(server: AudiobookshelfDownloader, server_lab
         print("❌ Invalid choice! Please try again.")
 
 
-async def get_server_config(prompt: str) -> Tuple[str, str]:
+async def get_server_config(prompt: str, ask_for_download_path: bool = False) -> Tuple[str, str, Optional[str]]:
     """Get server configuration from user"""
     print(f"\n{prompt}")
     server_url = input("Server URL (e.g., audiobooks.example.com or https://audiobooks.example.com): ").strip()
@@ -1184,7 +1184,14 @@ async def get_server_config(prompt: str) -> Tuple[str, str]:
 
     api_key = input("API Key: ").strip()
 
-    return server_url, api_key
+    download_path = None
+    if ask_for_download_path:
+        from config import DOWNLOAD_PATH
+        download_path = input(f"Download path (press Enter for default: {DOWNLOAD_PATH}): ").strip()
+        if not download_path:
+            download_path = DOWNLOAD_PATH
+
+    return server_url, api_key, download_path
 
 
 async def main():
@@ -1196,16 +1203,16 @@ async def main():
     try:
         # Get source server (where books will be downloaded from)
         print("\n📥 SOURCE SERVER (where to download books from)")
-        source_url, source_key = await get_server_config("Enter source server details:")
+        source_url, source_key, source_download_path = await get_server_config("Enter source server details:", ask_for_download_path=True)
 
         # Get target server (where books will be compared against)
         print("\n📊 TARGET SERVER (to compare against)")
-        target_url, target_key = await get_server_config("Enter target server details:")
+        target_url, target_key, target_download_path = await get_server_config("Enter target server details:")
 
         # Create server connections
         print("\n🔌 Connecting to servers...")
-        source_server = AudiobookshelfDownloader(source_url, source_key)
-        target_server = AudiobookshelfDownloader(target_url, target_key)
+        source_server = AudiobookshelfDownloader(source_url, source_key, source_download_path)
+        target_server = AudiobookshelfDownloader(target_url, target_key, target_download_path)
 
         async with source_server, target_server:
             # Test connections

@@ -198,16 +198,16 @@ async def run_server_comparison(source_key_name: str, target_key_name: str):
         manager = APIKeyManager()
 
         # Get source server details
-        source_url, source_key, _ = manager.get_key(source_key_name)
-        target_url, target_key, _ = manager.get_key(target_key_name)
+        source_url, source_key, source_download_path = manager.get_key(source_key_name)
+        target_url, target_key, target_download_path = manager.get_key(target_key_name)
 
         print(f"\n🔌 Connecting to servers...")
         print(f"📥 Source: {source_url}")
         print(f"📊 Target: {target_url}")
 
         # Create server connections
-        source_server = AudiobookshelfDownloader(source_url, source_key)
-        target_server = AudiobookshelfDownloader(target_url, target_key)
+        source_server = AudiobookshelfDownloader(source_url, source_key, source_download_path)
+        target_server = AudiobookshelfDownloader(target_url, target_key, target_download_path)
 
         async with source_server, target_server:
             # Test connections
