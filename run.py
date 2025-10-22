@@ -109,7 +109,7 @@ def select_books():
 
 
 
-async def open_book_selector_for_missing(server, missing_books, title):
+async def open_book_selector_for_missing(server, missing_books, title, library_id=None):
     """Open the interactive book selector for missing books."""
     try:
         from book_selector import BookSelector
@@ -132,7 +132,7 @@ async def open_book_selector_for_missing(server, missing_books, title):
                 books_for_selector.append(item)
 
         # Create book selector with the extracted books
-        selector = BookSelector(server)
+        selector = BookSelector(server, library_id)
 
         # Run the interactive selector with the properly formatted books
         await selector.select_books_interactive(books_for_selector)
@@ -153,6 +153,40 @@ async def open_book_selector_for_missing(server, missing_books, title):
             author = metadata.get('authorName', 'Unknown Author')
             print(f"  {i}. {title} by {author}")
         input("\nPress Enter to continue...")
+
+
+async def select_library_for_server(server, server_label: str):
+    """Select a single library for the given server."""
+    libraries = await server.get_libraries()
+    if not libraries:
+        print(f"❌ No libraries found on '{server_label}'")
+        return None, None, None
+
+    if len(libraries) == 1:
+        library = libraries[0]
+        print(
+            f"📚 '{server_label}' library: {library.get('name', 'Unknown')} (ID: {library.get('id', 'Unknown')})"
+        )
+        return {library['id']}, library['id'], library.get('name', 'Unknown')
+
+    print(f"\n📚 Libraries available on '{server_label}':")
+    for idx, library in enumerate(libraries, 1):
+        print(f"  {idx}. {library.get('name', 'Unknown')} (ID: {library.get('id', 'Unknown')})")
+
+    while True:
+        choice = input(f"Select library for '{server_label}' (1-{len(libraries)}): ").strip()
+        try:
+            choice_idx = int(choice) - 1
+        except ValueError:
+            print("❌ Invalid input! Enter the library number.")
+            continue
+
+        if 0 <= choice_idx < len(libraries):
+            library = libraries[choice_idx]
+            print(f"✅ Selected '{library.get('name', 'Unknown')}' on '{server_label}'")
+            return {library['id']}, library['id'], library.get('name', 'Unknown')
+
+        print("❌ Invalid choice! Please try again.")
 
 async def run_server_comparison(source_key_name: str, target_key_name: str):
     """Run server comparison using stored API keys."""
@@ -190,8 +224,37 @@ async def run_server_comparison(source_key_name: str, target_key_name: str):
 
             print("✅ Connected to both servers!")
 
+            source_library_ids, source_preferred_library_id, source_library_name = await select_library_for_server(
+                source_server,
+                source_key_name,
+            )
+            if source_library_ids is None:
+                input("Press Enter to continue...")
+                return
+
+            target_library_ids, target_preferred_library_id, target_library_name = await select_library_for_server(
+                target_server,
+                target_key_name,
+            )
+            if target_library_ids is None:
+                input("Press Enter to continue...")
+                return
+
+            print(
+                f"\n🎯 Comparing libraries:\n"
+                f"  📥 Source ({source_key_name}): {source_library_name}\n"
+                f"  📊 Target ({target_key_name}): {target_library_name}"
+            )
+
             # Create diff tool and compare
-            diff_tool = ServerDiff(source_server, target_server)
+            diff_tool = ServerDiff(
+                source_server,
+                target_server,
+                source_library_ids=source_library_ids,
+                target_library_ids=target_library_ids,
+                source_preferred_library_id=source_preferred_library_id,
+                target_preferred_library_id=target_preferred_library_id,
+            )
             results = await diff_tool.compare_servers()
 
             # Print results
@@ -219,62 +282,113 @@ async def run_server_comparison(source_key_name: str, target_key_name: str):
                 if fallback > 0:
                     print(f"   └─ Fallback matches (title+duration+size): {fallback}")
 
-            if missing_in_target or missing_in_source:
-                print(f"\n🔍 Missing Books Found:")
-                if missing_in_target:
-                    print(f"📥 {len(missing_in_target)} books in '{source_key_name}' missing from '{target_key_name}'")
-                if missing_in_source:
-                    print(f"📥 {len(missing_in_source)} books in '{target_key_name}' missing from '{source_key_name}'")
-
-                print(f"\nWhat would you like to do?")
-                option_num = 1
-
-                if missing_in_target:
-                    print(f"{option_num}. Browse & select FROM '{source_key_name}' ({len(missing_in_target)} books missing in '{target_key_name}')")
-                    option_num += 1
-                    print(f"{option_num}. Download ALL {len(missing_in_target)} books FROM '{source_key_name}' (missing in '{target_key_name}')")
-                    option_num += 1
-
-                if missing_in_source:
-                    print(f"{option_num}. Browse & select FROM '{target_key_name}' ({len(missing_in_source)} books missing in '{source_key_name}')")
-                    option_num += 1
-                    print(f"{option_num}. Download ALL {len(missing_in_source)} books FROM '{target_key_name}' (missing in '{source_key_name}')")
-                    option_num += 1
-
-                print(f"{option_num}. Exit")
-
-                choice = input(f"Enter choice (1-{option_num}): ").strip()
-
-                try:
-                    choice_num = int(choice)
-                    current_option = 1
-
-                    if missing_in_target:
-                        if choice_num == current_option:
-                            # Open book selector with missing books
-                            print(f"\n📚 Opening book selector for books in '{source_key_name}' missing from '{target_key_name}'...")
-                            await open_book_selector_for_missing(source_server, missing_in_target, f"Books missing from '{target_key_name}'")
-                        elif choice_num == current_option + 1:
-                            # Download from source server (books missing in target)
-                            print(f"🚀 Downloading {len(missing_in_target)} books FROM '{source_key_name}' (missing in '{target_key_name}')...")
-                            await diff_tool.download_missing_books(source_server, missing_in_target)
-                        current_option += 2
-
-                    if missing_in_source:
-                        if choice_num == current_option:
-                            # Open book selector with missing books
-                            print(f"\n📚 Opening book selector for books in '{target_key_name}' missing from '{source_key_name}'...")
-                            await open_book_selector_for_missing(target_server, missing_in_source, f"Books missing from '{source_key_name}'")
-                        elif choice_num == current_option + 1:
-                            # Download from target server (books missing in source)
-                            print(f"🚀 Downloading {len(missing_in_source)} books FROM '{target_key_name}' (missing in '{source_key_name}')...")
-                            await diff_tool.download_missing_books(target_server, missing_in_source)
-
-                except ValueError:
-                    print("❌ Invalid choice!")
-
-            else:
+            if not missing_in_target and not missing_in_source:
                 print("✅ No missing books found! Servers are perfectly in sync.")
+
+            if missing_in_target or missing_in_source or total_common:
+                options = []
+
+                if missing_in_target:
+                    options.append(
+                        (
+                            'browse_missing_in_target',
+                            f"Browse & select FROM '{source_key_name}' ({len(missing_in_target)} books missing in '{target_key_name}')",
+                        )
+                    )
+                    options.append(
+                        (
+                            'download_missing_in_target',
+                            f"Download ALL {len(missing_in_target)} books FROM '{source_key_name}' (missing in '{target_key_name}')",
+                        )
+                    )
+
+                if missing_in_source:
+                    options.append(
+                        (
+                            'browse_missing_in_source',
+                            f"Browse & select FROM '{target_key_name}' ({len(missing_in_source)} books missing in '{source_key_name}')",
+                        )
+                    )
+                    options.append(
+                        (
+                            'download_missing_in_source',
+                            f"Download ALL {len(missing_in_source)} books FROM '{target_key_name}' (missing in '{source_key_name}')",
+                        )
+                    )
+
+                if total_common:
+                    match_label = f"View matched books ({total_common} total)"
+                else:
+                    match_label = "View matched books (none found)"
+                options.append(('view_matches', match_label))
+                options.append(('exit', "Exit"))
+
+                while True:
+                    print("\nWhat would you like to do?")
+                    for idx, (_, label) in enumerate(options, 1):
+                        print(f"{idx}. {label}")
+
+                    choice = input(f"Enter choice (1-{len(options)}): ").strip()
+
+                    try:
+                        choice_num = int(choice)
+                        if not 1 <= choice_num <= len(options):
+                            raise ValueError
+                    except ValueError:
+                        print("❌ Invalid choice!")
+                        continue
+
+                    action_key = options[choice_num - 1][0]
+
+                    if action_key == 'browse_missing_in_target':
+                        print(
+                            f"\n📚 Opening book selector for books in '{source_key_name}' missing from '{target_key_name}'..."
+                        )
+                        await open_book_selector_for_missing(
+                            source_server,
+                            missing_in_target,
+                            f"Books missing from '{target_key_name}'",
+                            library_id=source_preferred_library_id,
+                        )
+                        break
+                    if action_key == 'download_missing_in_target':
+                        print(
+                            f"🚀 Downloading {len(missing_in_target)} books FROM '{source_key_name}' (missing in '{target_key_name}')..."
+                        )
+                        await diff_tool.download_missing_books(
+                            source_server,
+                            missing_in_target,
+                            preferred_library_id=source_preferred_library_id,
+                        )
+                        break
+                    if action_key == 'browse_missing_in_source':
+                        print(
+                            f"\n📚 Opening book selector for books in '{target_key_name}' missing from '{source_key_name}'..."
+                        )
+                        await open_book_selector_for_missing(
+                            target_server,
+                            missing_in_source,
+                            f"Books missing from '{source_key_name}'",
+                            library_id=target_preferred_library_id,
+                        )
+                        break
+                    if action_key == 'download_missing_in_source':
+                        print(
+                            f"🚀 Downloading {len(missing_in_source)} books FROM '{target_key_name}' (missing in '{source_key_name}')..."
+                        )
+                        await diff_tool.download_missing_books(
+                            target_server,
+                            missing_in_source,
+                            preferred_library_id=target_preferred_library_id,
+                        )
+                        break
+                    if action_key == 'view_matches':
+                        diff_tool.print_match_details(results)
+                        input("\nPress Enter to return to the comparison menu...")
+                        continue
+                    if action_key == 'exit':
+                        break
+                # End while loop
 
             input("\nPress Enter to continue...")
 

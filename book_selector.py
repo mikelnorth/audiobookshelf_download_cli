@@ -7,12 +7,12 @@ import asyncio
 import os
 import sys
 import argparse
-from typing import List, Dict, Set
+from typing import Dict, List, Optional, Set
 from audiobookshelf_downloader import AudiobookshelfDownloader
 
 
 class BookSelector:
-    def __init__(self, downloader: AudiobookshelfDownloader, library_id: str = None):
+    def __init__(self, downloader: AudiobookshelfDownloader, library_id: Optional[str] = None):
         self.downloader = downloader
         self.library_id = library_id
         self.selected_books: Set[str] = set()
@@ -106,12 +106,13 @@ class BookSelector:
         """Display available commands."""
         return """
 Commands:
-  [1-20]     - Select/unselect book (toggle selection)
+  [num]      - Select/unselect book by its overall number (e.g., 25)
   n/next     - Next page
   p/prev     - Previous page
+  g/goto     - Jump to a specific page number (e.g., g 5)
   a/all      - Select all books on current page
   u/unall    - Unselect all books on current page
-  s/select   - Select books by range (e.g., 1-5,10,15-20)
+  s/select   - Select books by absolute range (e.g., 21-30,35)
   f/filter   - Filter books by title/author (or 'f <term>' for direct filter)
   cf/clearfilter - Clear current filter and show all books
   c/clear    - Clear all selections
@@ -138,6 +139,7 @@ Commands:
 
             # Display current page
             page_books = self.display_books(filtered_books, current_page, per_page)
+            max_pages = max(1, (len(filtered_books) + per_page - 1) // per_page)
 
             # Show commands
             print(self.get_selection_commands())
@@ -165,12 +167,27 @@ Commands:
                     input("Press Enter to continue...")
                     continue
             elif command in ['n', 'next']:
-                max_pages = (len(filtered_books) + per_page - 1) // per_page
                 if current_page < max_pages - 1:
                     current_page += 1
             elif command in ['p', 'prev']:
                 if current_page > 0:
                     current_page -= 1
+            elif command in ['g', 'goto'] or command.startswith('g ') or command.startswith('goto '):
+                if command in ['g', 'goto']:
+                    page_input = input(f"Enter page number (1-{max_pages}): ").strip()
+                else:
+                    page_input = command.split(' ', 1)[1].strip()
+
+                try:
+                    page_number = int(page_input)
+                    if 1 <= page_number <= max_pages:
+                        current_page = page_number - 1
+                    else:
+                        print(f"❌ Page must be between 1 and {max_pages}!")
+                        input("Press Enter to continue...")
+                except ValueError:
+                    print("❌ Invalid page number!")
+                    input("Press Enter to continue...")
             elif command in ['a', 'all']:
                 for book in page_books:
                     self.selected_books.add(book.get('id', ''))
@@ -198,12 +215,12 @@ Commands:
                     filtered_books = self._filter_books(books)
                 current_page = 0
             elif command.startswith('s') or command.startswith('select'):
-                self._select_by_range(command, page_books)
+                self._select_by_range(command, filtered_books)
             elif command.isdigit():
-                # Toggle book selection
+                # Toggle book selection by absolute number
                 book_num = int(command) - 1
-                if 0 <= book_num < len(page_books):
-                    book = page_books[book_num]
+                if 0 <= book_num < len(filtered_books):
+                    book = filtered_books[book_num]
                     book_id = book.get('id', '')
                     if book_id in self.selected_books:
                         self.selected_books.remove(book_id)
@@ -217,8 +234,8 @@ Commands:
         selected_books = [book for book in books if book.get('id', '') in self.selected_books]
         return selected_books
 
-    def _select_by_range(self, command: str, page_books: List[Dict]):
-        """Select books by range (e.g., 1-5,10,15-20)."""
+    def _select_by_range(self, command: str, all_books: List[Dict]):
+        """Select books by absolute range (matching the displayed numbers)."""
         try:
             # Parse range command
             parts = command.split(' ', 1)
@@ -228,17 +245,51 @@ Commands:
                 range_str = input("Enter range (e.g., 1-5,10,15-20): ").strip()
 
             # Parse ranges
+            invalid_entries = []
+            total_books = len(all_books)
+
+            def resolve_index(selection_number: int) -> Optional[int]:
+                """Resolve an absolute selection number to an index in all_books."""
+                if selection_number <= 0:
+                    return None
+
+                idx = selection_number - 1
+
+                if 0 <= idx < total_books:
+                    return idx
+                return None
+
             for part in range_str.split(','):
                 part = part.strip()
+                if not part:
+                    continue
+
                 if '-' in part:
-                    start, end = map(int, part.split('-'))
-                    for i in range(start-1, end):
-                        if 0 <= i < len(page_books):
-                            self.selected_books.add(page_books[i].get('id', ''))
+                    start_str, end_str = part.split('-', 1)
+                    start = int(start_str)
+                    end = int(end_str)
+
+                    if start > end:
+                        start, end = end, start
+
+                    for selection_number in range(start, end + 1):
+                        idx = resolve_index(selection_number)
+                        if idx is None:
+                            invalid_entries.append(selection_number)
+                            continue
+                        self.selected_books.add(all_books[idx].get('id', ''))
                 else:
-                    i = int(part) - 1
-                    if 0 <= i < len(page_books):
-                        self.selected_books.add(page_books[i].get('id', ''))
+                    selection_number = int(part)
+                    idx = resolve_index(selection_number)
+                    if idx is None:
+                        invalid_entries.append(selection_number)
+                        continue
+                    self.selected_books.add(all_books[idx].get('id', ''))
+
+            if invalid_entries:
+                unique_invalids = sorted(set(invalid_entries))
+                print(f"⚠️  Skipped invalid selections: {', '.join(map(str, unique_invalids))}")
+                input("Press Enter to continue...")
         except (ValueError, IndexError):
             print("❌ Invalid range format!")
             input("Press Enter to continue...")

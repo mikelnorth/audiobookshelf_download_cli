@@ -9,7 +9,8 @@ import asyncio
 import aiohttp
 import sys
 import logging
-from typing import Dict, List, Set, Tuple
+from collections import Counter, defaultdict
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from audiobookshelf_downloader import AudiobookshelfDownloader
 # Default logging configuration
 DEFAULT_LOG_LEVEL = "INFO"
@@ -21,9 +22,52 @@ logger = logging.getLogger(__name__)
 
 
 class ServerDiff:
-    def __init__(self, source_server: AudiobookshelfDownloader, target_server: AudiobookshelfDownloader):
+    def __init__(
+        self,
+        source_server: AudiobookshelfDownloader,
+        target_server: AudiobookshelfDownloader,
+        source_library_ids: Optional[Iterable[str]] = None,
+        target_library_ids: Optional[Iterable[str]] = None,
+        source_preferred_library_id: Optional[str] = None,
+        target_preferred_library_id: Optional[str] = None,
+    ):
         self.source_server = source_server
         self.target_server = target_server
+        self.source_library_ids = self._normalize_library_ids(source_library_ids)
+        self.target_library_ids = self._normalize_library_ids(target_library_ids)
+        self.source_preferred_library_id = self._validate_preferred_library(
+            self.source_library_ids, source_preferred_library_id
+        )
+        self.target_preferred_library_id = self._validate_preferred_library(
+            self.target_library_ids, target_preferred_library_id
+        )
+
+    def _normalize_library_ids(self, library_ids: Optional[Iterable[str]]) -> Optional[Set[str]]:
+        if not library_ids:
+            return None
+        return {lib_id for lib_id in library_ids if lib_id}
+
+    def _validate_preferred_library(
+        self,
+        library_ids: Optional[Set[str]],
+        preferred_id: Optional[str],
+    ) -> Optional[str]:
+        if library_ids is None or preferred_id is None:
+            return preferred_id
+
+        if preferred_id in library_ids:
+            return preferred_id
+
+        if library_ids:
+            fallback = next(iter(library_ids))
+            logger.warning(
+                "⚠️  Preferred library %s not in selected library set; using %s instead.",
+                preferred_id,
+                fallback,
+            )
+            return fallback
+
+        return None
 
     def _normalize_title(self, title: str) -> str:
         """Normalize title for comparison with improved subtitle handling"""
@@ -478,7 +522,12 @@ class ServerDiff:
 
         return final_match
 
-    async def download_missing_books(self, server: AudiobookshelfDownloader, missing_books: List[Dict]):
+    async def download_missing_books(
+        self,
+        server: AudiobookshelfDownloader,
+        missing_books: List[Dict],
+        preferred_library_id: Optional[str] = None,
+    ):
         """Download missing books to a server."""
         if not missing_books:
             print("✅ No books to download!")
@@ -492,12 +541,31 @@ class ServerDiff:
             books_to_download.append(item['book'])
 
         # Get the library ID (use the first library)
+        if preferred_library_id is None:
+            if server is self.source_server:
+                preferred_library_id = self.source_preferred_library_id
+            elif server is self.target_server:
+                preferred_library_id = self.target_preferred_library_id
+
         libraries = await server.get_libraries()
         if not libraries:
             print("❌ No libraries found on target server!")
             return
 
-        library_id = libraries[0]['id']
+        library_id = None
+
+        if preferred_library_id:
+            for library in libraries:
+                if library['id'] == preferred_library_id:
+                    library_id = library['id']
+                    break
+            if library_id is None:
+                print(
+                    "⚠️  Preferred library not found on server, defaulting to first available library."
+                )
+
+        if library_id is None:
+            library_id = libraries[0]['id']
 
         # Download the books
         success_count = 0
@@ -520,7 +588,11 @@ class ServerDiff:
         print(f"  ✅ Successfully downloaded: {success_count}")
         print(f"  ❌ Failed: {len(books_to_download) - success_count}")
 
-    async def get_server_books(self, server: AudiobookshelfDownloader) -> Dict[str, Dict]:
+    async def get_server_books(
+        self,
+        server: AudiobookshelfDownloader,
+        library_filter: Optional[Set[str]] = None,
+    ) -> Dict[str, Dict]:
         """Get all books from a server, indexed by unique item ID
 
         Each item is stored separately (no collapsing of editions)
@@ -535,6 +607,11 @@ class ServerDiff:
 
             for library in libraries:
                 library_id = library['id']
+                if library_filter is not None and library_id not in library_filter:
+                    logger.info(
+                        f"⏭️  Skipping library {library.get('name', 'Unknown Library')} ({library_id})"
+                    )
+                    continue
                 library_books = await server.get_library_items(library_id)
 
                 for book in library_books:
@@ -565,8 +642,14 @@ class ServerDiff:
         logger.info("🔍 Comparing servers...")
 
         # Get ALL items from both servers (by unique ID, no collapsing)
-        source_books = await self.get_server_books(self.source_server)
-        target_books = await self.get_server_books(self.target_server)
+        source_books = await self.get_server_books(
+            self.source_server,
+            self.source_library_ids,
+        )
+        target_books = await self.get_server_books(
+            self.target_server,
+            self.target_library_ids,
+        )
 
         logger.info(f"📚 Source server: {len(source_books)} items")
         logger.info(f"📚 Target server: {len(target_books)} items")
@@ -574,6 +657,12 @@ class ServerDiff:
         # Group items by normalized metadata key for comparison
         source_by_metadata = {}  # normalized_key -> [list of item IDs]
         target_by_metadata = {}
+
+        # Track detailed match information
+        primary_match_groups: List[Dict] = []
+        author_overlap_details: List[Dict] = []
+        fallback_exact_details: List[Dict] = []
+        fallback_flexible_details: List[Dict] = []
 
         for item_id, item_data in source_books.items():
             metadata_key = self._create_book_key(item_data['book'])
@@ -593,9 +682,30 @@ class ServerDiff:
 
         for metadata_key in source_by_metadata:
             if metadata_key in target_by_metadata:
+                source_ids = source_by_metadata[metadata_key]
+                target_ids = target_by_metadata[metadata_key]
+
                 # This book exists on both servers - mark ALL versions as matched
-                matched_source_ids.update(source_by_metadata[metadata_key])
-                matched_target_ids.update(target_by_metadata[metadata_key])
+                matched_source_ids.update(source_ids)
+                matched_target_ids.update(target_ids)
+
+                # Capture detailed match information
+                representative_source = source_books[source_ids[0]] if source_ids else None
+                normalized_info = None
+                if representative_source:
+                    normalized_info = self._extract_book_metadata(representative_source['book'])
+
+                primary_match_groups.append({
+                    'match_type': 'primary',
+                    'source_items': [source_books[item_id] for item_id in source_ids],
+                    'target_items': [target_books[item_id] for item_id in target_ids],
+                    'reason': 'Matched by normalized author and title',
+                    'normalized': {
+                        'title': normalized_info['title'] if normalized_info else None,
+                        'author': normalized_info['author'] if normalized_info else None,
+                        'key': metadata_key,
+                    },
+                })
 
         # Items that don't have a metadata match
         missing_in_target_primary = set(source_books.keys()) - matched_source_ids
@@ -648,6 +758,19 @@ class ServerDiff:
                             self._authors_overlap(source_metadata['raw_author'], target_metadata['raw_author'])):
                             author_overlap_matched_source.add(source_key)
                             author_overlap_matched_target.add(target_key)
+                            author_overlap_details.append({
+                                'match_type': 'author_overlap',
+                                'source_items': [source_books[source_key]],
+                                'target_items': [target_books[target_key]],
+                                'reason': 'Matched by normalized title with overlapping authors',
+                                'normalized': {
+                                    'title': source_metadata['title'],
+                                    'source_author': source_metadata['author'],
+                                    'target_author': target_metadata['author'],
+                                    'source_key': self._create_book_key(source_books[source_key]['book']),
+                                    'target_key': self._create_book_key(target_books[target_key]['book']),
+                                },
+                            })
                             break  # Found a match for this source book
 
         # Remove author overlap matches from missing lists
@@ -740,6 +863,24 @@ class ServerDiff:
                 logger.info(f"   Target author: '{target_metadata['raw_author']}'")
                 logger.info(f"   Duration: {source_metadata['duration']}s, Size: {source_metadata['size']} bytes")
 
+                fallback_exact_details.append({
+                    'match_type': 'fallback_exact',
+                    'source_items': [source_books[source_key]],
+                    'target_items': [target_books[target_key]],
+                    'reason': 'Matched by title with identical duration and size',
+                    'normalized': {
+                        'title': source_metadata['title'],
+                        'source_key': self._create_book_key(source_books[source_key]['book']),
+                        'target_key': self._create_book_key(target_books[target_key]['book']),
+                    },
+                    'extra_details': {
+                        'source_duration': source_metadata['duration'],
+                        'target_duration': target_metadata['duration'],
+                        'source_size': source_metadata['size'],
+                        'target_size': target_metadata['size'],
+                    },
+                })
+
                 # Remove from missing lists
                 missing_in_target_primary.discard(source_key)
                 missing_in_source_primary.discard(target_key)
@@ -760,6 +901,24 @@ class ServerDiff:
                 logger.info(f"   Target author: '{target_metadata['raw_author']}'")
                 logger.info(f"   Duration: ~{source_metadata['duration']}s, Size: ~{source_metadata['size']} bytes")
 
+                fallback_flexible_details.append({
+                    'match_type': 'fallback_flexible',
+                    'source_items': [source_books[source_key]],
+                    'target_items': [target_books[target_key]],
+                    'reason': 'Matched by title with similar duration and size (tolerance applied)',
+                    'normalized': {
+                        'title': source_metadata['title'],
+                        'source_key': self._create_book_key(source_books[source_key]['book']),
+                        'target_key': self._create_book_key(target_books[target_key]['book']),
+                    },
+                    'extra_details': {
+                        'source_duration': source_metadata['duration'],
+                        'target_duration': target_metadata['duration'],
+                        'source_size': source_metadata['size'],
+                        'target_size': target_metadata['size'],
+                    },
+                })
+
                 # Remove from missing lists
                 missing_in_target_primary.discard(source_key)
                 missing_in_source_primary.discard(target_key)
@@ -774,58 +933,245 @@ class ServerDiff:
             'author_overlap_matches': author_overlap_matches,
             'fallback_matches': fallback_matches,
             'source_total': len(source_books),
-            'target_total': len(target_books)
+            'target_total': len(target_books),
+            'source_library_ids': self.source_library_ids,
+            'target_library_ids': self.target_library_ids,
+            'match_details': {
+                'primary': primary_match_groups,
+                'author_overlap': author_overlap_details,
+                'fallback_exact': fallback_exact_details,
+                'fallback_flexible': fallback_flexible_details,
+            },
         }
 
         return result
 
+
     def print_comparison_results(self, results: Dict[str, List[Dict]]):
-        """Print comparison results in a nice format"""
-        print("\n📊 Server Comparison Results")
-        print("=" * 50)
+        """Pretty-print server comparison results."""
+        if results is None:
+            print("ℹ️ No results to display.")
+            return
 
-        print(f"📚 Source Server: {results['source_total']} books")
-        print(f"📚 Target Server: {results['target_total']} books")
-
-        # Calculate total matches
-        primary_matches = len(results['common_books'])
+        missing_in_target = results.get('missing_in_target') or []
+        missing_in_source = results.get('missing_in_source') or []
+        common_books = results.get('common_books') or []
         author_overlap_matches = results.get('author_overlap_matches', 0)
         fallback_matches = results.get('fallback_matches', 0)
-        total_matches = primary_matches + author_overlap_matches + fallback_matches
+        source_total = results.get('source_total')
+        target_total = results.get('target_total')
 
-        print(f"📚 Common Books: {total_matches} books")
-        if author_overlap_matches > 0 or fallback_matches > 0:
-            print(f"   ├─ Primary matches (author+title): {primary_matches}")
-            if author_overlap_matches > 0:
-                print(f"   ├─ Author overlap matches: {author_overlap_matches}")
-            if fallback_matches > 0:
-                print(f"   └─ Fallback matches (title+duration+size): {fallback_matches}")
+        print("\n📊 Comparison Summary")
+        print("=" * 40)
+        if source_total is not None and target_total is not None:
+            print(f"  📥 Source items: {source_total}")
+            print(f"  📊 Target items: {target_total}")
+        print(f"  🤝 Common items: {len(common_books)}")
+        print(f"  👥 Author overlap matches: {author_overlap_matches}")
+        print(f"  🔄 Fallback matches: {fallback_matches}")
+        print(f"  📤 Missing in target: {len(missing_in_target)}")
+        print(f"  📥 Missing in source: {len(missing_in_source)}")
 
-        print(f"\n📥 Missing in Target Server: {len(results['missing_in_target'])} books")
-        if results['missing_in_target']:
-            print("   (Books in source but not in target)")
-            for i, item in enumerate(results['missing_in_target'][:10], 1):  # Show first 10
-                book = item['book']
+        def summarize_by_library(items: List[Dict]) -> Dict[str, int]:
+            summary = defaultdict(int)
+            for item in items:
+                library_name = item.get('library_name') or 'Unknown Library'
+                summary[library_name] += 1
+            return dict(sorted(summary.items(), key=lambda kv: kv[0].lower()))
+
+        def print_sample(items: List[Dict], label: str):
+            if not items:
+                return
+
+            summary = summarize_by_library(items)
+            print(f"\n{label} (by library):")
+            for library_name, count in summary.items():
+                print(f"  • {library_name}: {count}")
+
+            max_preview = 10
+            print(f"\nFirst {min(len(items), max_preview)} entries:")
+            for idx, item in enumerate(items[:max_preview], 1):
+                book = item.get('book', {})
                 media = book.get('media', {})
                 metadata = media.get('metadata', {})
-                title = metadata.get('title', book.get('title', 'Unknown'))
-                author = metadata.get('authorName', book.get('author', 'Unknown'))
-                print(f"   {i}. {title} by {author}")
-            if len(results['missing_in_target']) > 10:
-                print(f"   ... and {len(results['missing_in_target']) - 10} more")
+                title = metadata.get('title', book.get('title', 'Unknown Title'))
+                author = metadata.get('authorName', book.get('author', 'Unknown Author'))
+                library_name = item.get('library_name', 'Unknown Library')
+                print(f"  {idx}. {title} — {author} ({library_name})")
 
-        print(f"\n📤 Missing in Source Server: {len(results['missing_in_source'])} books")
-        if results['missing_in_source']:
-            print("   (Books in target but not in source)")
-            for i, item in enumerate(results['missing_in_source'][:10], 1):  # Show first 10
-                book = item['book']
-                media = book.get('media', {})
-                metadata = media.get('metadata', {})
-                title = metadata.get('title', book.get('title', 'Unknown'))
-                author = metadata.get('authorName', book.get('author', 'Unknown'))
-                print(f"   {i}. {title} by {author}")
-            if len(results['missing_in_source']) > 10:
-                print(f"   ... and {len(results['missing_in_source']) - 10} more")
+            if len(items) > max_preview:
+                print(f"  … and {len(items) - max_preview} more")
+
+        print_sample(missing_in_target, "📤 Missing on target")
+        print_sample(missing_in_source, "📥 Missing on source")
+
+        if not missing_in_target and not missing_in_source:
+            print("\n✅ No missing books found! Both servers are in sync.")
+
+    def print_match_details(self, results: Dict[str, List[Dict]], max_entries_per_type: int = 25):
+        """Pretty-print detailed match information by match type."""
+        match_details = results.get('match_details') if results else None
+        if not match_details:
+            print("ℹ️ No match details available.")
+            return
+
+        sections = [
+            ('primary', "Primary matches (normalized author + title)"),
+            ('author_overlap', "Author overlap matches"),
+            ('fallback_exact', "Fallback matches (exact duration + size)"),
+            ('fallback_flexible', "Fallback matches (fuzzy duration + size)"),
+        ]
+
+        print("\n🤝 Matched Items")
+        print("=" * 50)
+
+        for key, label in sections:
+            entries = match_details.get(key, [])
+            print(f"\n{label}: {len(entries)}")
+            if not entries:
+                continue
+
+            limit = min(len(entries), max_entries_per_type)
+            for idx in range(limit):
+                entry = entries[idx]
+                self._print_match_entry(idx + 1, entry)
+
+            if len(entries) > max_entries_per_type:
+                remaining = len(entries) - max_entries_per_type
+                print(f"  … and {remaining} more")
+
+    def _print_match_entry(self, index: int, entry: Dict):
+        """Print a single match entry with context."""
+        source_items = entry.get('source_items') or []
+        target_items = entry.get('target_items') or []
+        reason = entry.get('reason', '')
+        normalized = entry.get('normalized', {}) or {}
+        extra_details = entry.get('extra_details', {}) or {}
+
+        display_item = source_items[0] if source_items else (target_items[0] if target_items else None)
+        title = "Unknown Title"
+        normalized_info = None
+        if display_item:
+            book = display_item.get('book', {})
+            media = book.get('media', {})
+            metadata = media.get('metadata', {})
+            title = metadata.get('title', book.get('title', 'Unknown Title'))
+            normalized_info = self._extract_book_metadata(book)
+
+        print(f"  {index}. {title}")
+
+        if source_items:
+            print(f"     Source: {self._format_item_summary(source_items)}")
+        if target_items:
+            print(f"     Target: {self._format_item_summary(target_items)}")
+
+        if normalized:
+            normalized_title = normalized.get('title')
+            normalized_author = normalized.get('author')
+            source_author_norm = normalized.get('source_author')
+            target_author_norm = normalized.get('target_author')
+            normalized_key = normalized.get('key')
+            source_key = normalized.get('source_key')
+            target_key = normalized.get('target_key')
+
+            normalized_segments = []
+            if normalized_author or source_author_norm or target_author_norm:
+                if normalized_author:
+                    normalized_segments.append(f"author='{normalized_author}'")
+                else:
+                    if source_author_norm:
+                        normalized_segments.append(f"source_author='{source_author_norm}'")
+                    if target_author_norm:
+                        normalized_segments.append(f"target_author='{target_author_norm}'")
+            if normalized_title:
+                normalized_segments.append(f"title='{normalized_title}'")
+            if normalized_key:
+                normalized_segments.append(f"key='{normalized_key}'")
+            else:
+                if source_key:
+                    normalized_segments.append(f"source_key='{source_key}'")
+                if target_key:
+                    normalized_segments.append(f"target_key='{target_key}'")
+
+            if normalized_segments:
+                print(f"     Normalized: {', '.join(normalized_segments)}")
+        elif normalized_info:
+            print(
+                f"     Normalized: author='{normalized_info['author']}', title='{normalized_info['title']}'"
+            )
+
+        if extra_details:
+            duration_source = extra_details.get('source_duration')
+            duration_target = extra_details.get('target_duration')
+            size_source = extra_details.get('source_size')
+            size_target = extra_details.get('target_size')
+
+            detail_segments = []
+            if duration_source is not None or duration_target is not None:
+                detail_segments.append(
+                    f"duration={duration_source}s vs {duration_target}s"
+                )
+            if size_source is not None or size_target is not None:
+                detail_segments.append(
+                    f"size={size_source} bytes vs {size_target} bytes"
+                )
+            if detail_segments:
+                print(f"     Details: {', '.join(detail_segments)}")
+
+        if reason:
+            print(f"     Match reason: {reason}")
+
+    def _format_item_summary(self, items: List[Dict]) -> str:
+        """Summarize a list of items (from one server) for display."""
+        if not items:
+            return "(none)"
+
+        primary = items[0]
+        book = primary.get('book', {})
+        media = book.get('media', {})
+        metadata = media.get('metadata', {})
+        author = metadata.get('authorName', book.get('author', 'Unknown Author'))
+
+        libraries = [item.get('library_name', 'Unknown Library') for item in items]
+        counts = Counter(libraries)
+        library_summary = ', '.join(f"{name}×{count}" for name, count in counts.items())
+
+        return f"{author} — {library_summary}"
+
+async def select_library_for_server(server: AudiobookshelfDownloader, server_label: str):
+    """Prompt the user to select a library for the given server."""
+    libraries = await server.get_libraries()
+    if not libraries:
+        print(f"❌ No libraries found on '{server_label}'")
+        return None, None, None
+
+    if len(libraries) == 1:
+        library = libraries[0]
+        name = library.get('name', 'Unknown')
+        print(f"📚 '{server_label}' library: {name} (ID: {library.get('id', 'Unknown')})")
+        return {library['id']}, library['id'], name
+
+    print(f"\n📚 Libraries available on '{server_label}':")
+    for index, library in enumerate(libraries, 1):
+        name = library.get('name', 'Unknown')
+        library_id = library.get('id', 'Unknown')
+        print(f"  {index}. {name} (ID: {library_id})")
+
+    while True:
+        choice = input(f"Select library for '{server_label}' (1-{len(libraries)}): ").strip()
+        try:
+            choice_index = int(choice) - 1
+        except ValueError:
+            print("❌ Invalid input! Enter the library number.")
+            continue
+
+        if 0 <= choice_index < len(libraries):
+            library = libraries[choice_index]
+            name = library.get('name', 'Unknown')
+            print(f"✅ Selected '{name}' on '{server_label}'")
+            return {library['id']}, library['id'], name
+
+        print("❌ Invalid choice! Please try again.")
 
 
 async def get_server_config(prompt: str) -> Tuple[str, str]:
@@ -873,8 +1219,35 @@ async def main():
 
             print("✅ Connected to both servers!")
 
+            source_library_ids, source_preferred_library_id, source_library_name = await select_library_for_server(
+                source_server,
+                "source",
+            )
+            if source_library_ids is None:
+                return
+
+            target_library_ids, target_preferred_library_id, target_library_name = await select_library_for_server(
+                target_server,
+                "target",
+            )
+            if target_library_ids is None:
+                return
+
+            print(
+                f"\n🎯 Comparing libraries:\n"
+                f"  📥 Source: {source_library_name}\n"
+                f"  📊 Target: {target_library_name}"
+            )
+
             # Create diff tool
-            diff_tool = ServerDiff(source_server, target_server)
+            diff_tool = ServerDiff(
+                source_server,
+                target_server,
+                source_library_ids=source_library_ids,
+                target_library_ids=target_library_ids,
+                source_preferred_library_id=source_preferred_library_id,
+                target_preferred_library_id=target_preferred_library_id,
+            )
 
             # Compare servers
             results = await diff_tool.compare_servers()
